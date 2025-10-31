@@ -1,0 +1,542 @@
+version: 2.1
+
+orbs:
+  aws-ecr: circleci/aws-ecr@9.5.1
+  aws-cli: circleci/aws-cli@5.3.2
+  maven: circleci/maven@2.0.0
+
+parameters:
+  jenkinsdsl_repo_url:
+    type: string
+    default: "github.com/Cobre-Colombia/jenkins-dsl.git"
+    description: "Host y ruta del repo de jenkins-dsl"
+  jenkinsdsl_branch:
+    type: string
+    default: "master"
+    description: "Branch del repositorio de jenkins-dsl"
+  gitops_repo_url:
+    type: string
+    default: "github.com/Cobre-Colombia/gitops.git"
+    description: "Host y ruta del repo de gitops"
+  gitops_branch:
+    type: string
+    default: "staging"
+    description: "Branch del repositorio de gitops"
+  component_type:
+    type: enum
+    enum: [ "util", "core" ]
+    default: "util"
+    description: "Tipo de componente"
+  component_name:
+    type: string
+    default: ""
+    description: "Nombre del componente a probar (por ejemplo, util-network-routing)"
+  pod_namespace:
+    type: string
+    enum: [ "util-qa", "pxt-qa" ]
+    default: "util-qa"
+    description: "Pod del namespace"
+  version_tag:
+    type: string
+    default: "latest"
+  cleanup_workflow:
+    type: boolean
+    default: false
+
+executors:
+  default:
+    docker:
+      - image: cimg/base:stable
+
+references:
+  workspace_root: &workspace_root /tmp/workspace
+  attach_workspace: &attach_workspace
+    attach_workspace:
+      at: *workspace_root
+
+jobs:
+  prepare-config:
+    executor: default
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+      NAMESPACE: "<< pipeline.parameters.pod_namespace >>"
+    steps:
+      - checkout
+      - run:
+          name: Crear WORKSPACE_ROOT global
+          command: |
+            mkdir -p $WORKSPACE_ROOT
+            echo "Directorio de workspace creado en: $WORKSPACE_ROOT"
+      - run:
+          name: Generar datos dinámicos
+          command: |
+            set -e
+            # Fecha actual
+            currentDate=$(date +'%Y-%m-%d_%H-%M-%S')
+            
+            # Random de 8 caracteres
+            random=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c8) 
+            
+            
+            # Nombre del contenedor/aplicación
+            appName="test-container-${random}"
+            appName2="test-automation-123"
+            
+            # Guardar variables en BAS_ENV
+            echo "export APP_NAME='$appName'" >> "$BASH_ENV"
+            echo "export RANDOM_GENERATED=$random" >> "$BASH_ENV"
+            echo "export CURRENT_DATE=$currentDate" >> "$BASH_ENV"
+            
+            # Exportar variables para otros jobs
+            echo "$currentDate" > $WORKSPACE_ROOT/current-date
+            echo "$appName" > $WORKSPACE_ROOT/app-name
+            echo "$random" > $WORKSPACE_ROOT/random-generated
+      - run:
+          name: Clonar y obtener archivos de configuración
+          command: |
+            rm -rf jenkins-dsl
+            git clone --branch << pipeline.parameters.jenkinsdsl_branch >> "https://${GITHUB_COBRE_TOKEN}@<< pipeline.parameters.jenkinsdsl_repo_url >>" 
+            cp -r jenkins-dsl/qa-api-test-libraries/* ./
+            ls -R
+            echo "Archivos en ruta mocks"
+            ls -l mocks
+      - run:
+          name: Definir registro en ECR para usar imágenes docker
+          command: |
+            if [ "<< pipeline.parameters.component_type >>" == "util" ]; then
+              BASE_REGISTRY='/qa/utilitarios'
+              echo "El base registry es: $BASE_REGISTRY"
+            else 
+              BASE_REGISTRY="/cobre/qa"
+              echo "El base registry es: $BASE_REGISTRY"
+            fi
+            echo "BASE_REGISTRY=${BASE_REGISTRY}" > $WORKSPACE_ROOT/base_registry
+      - run:
+          name: Preparar archivos yml de configuración del entorno
+          command: |
+            # Exportando algunas variables
+            echo "Nombre contenedor: $APP_NAME"
+            echo "Contenido de \$BASH_ENV ($BASH_ENV):"
+            cat "$BASH_ENV"
+            export APP_ECR="891899566293.dkr.ecr.us-east-2.amazonaws.com/cobre/testing-images/qa_utilnetworkroutingacceptancetest:<< pipeline.number >>-app"
+            export MOCK_ECR="891899566293.dkr.ecr.us-east-2.amazonaws.com/cobre/testing-images/qa_utilnetworkroutingacceptancetest:<< pipeline.number >>-mocks"
+            
+            # Instalar envsubst
+            sudo apt-get update
+            sudo apt-get install -y gettext
+            envsubst --version
+
+            # Renderizando los archivos para crear aplicación en Kubernetes
+            mkdir -p "$WORKSPACE_ROOT/rendered"
+            for file in test-container-k8s-qa/*; do
+              filename=$(basename $file)
+              envsubst < "$file" > "$WORKSPACE_ROOT/rendered/$filename"
+              echo "Contenido renderizado del archivo: $filename"
+              cat "$WORKSPACE_ROOT/rendered/$filename"
+            done
+      - run:
+          name: Subir archivos a repositorio gitops
+          command: |
+            # Preparar variables
+            filePathArgocd="utils/$APP_NAME"
+            # Exportar variables
+            echo "$filePathArgocd" > $WORKSPACE_ROOT/file-path-for-argocd
+
+            # Clonar el repo
+            rm -rf gitops
+            git clone "https://${GITHUB_COBRE_TOKEN}@<< pipeline.parameters.gitops_repo_url >>" "$WORKSPACE_ROOT/gitops"
+            cd "$WORKSPACE_ROOT/gitops"
+            git checkout "<< pipeline.parameters.gitops_branch >>"
+
+            # Mover los nuevos manifiestos
+            pwd
+            ls -la $WORKSPACE_ROOT/rendered
+            mv -f $WORKSPACE_ROOT/rendered $filePathArgocd
+
+            # Verificar archivos antes del commit
+            echo "Verificando archivos en $filePathArgocd..."
+            if [ "$(ls -A "$filePathArgocd")" ]; then
+              echo "Archivos encontrados en $filePathArgocd"
+            else
+              echo "No se encontraron archivos"
+            fi
+
+            # commit y push
+            git config --global user.name "infra-arq-cobre"
+            git config --global user.email "devops@cobre.co"
+            git add .
+            git commit -m "Add $APP_NAME in utils folder for $CIRCLE_PROJECT_REPONAME Api Test"
+            git pull --rebase origin staging
+            git push
+            sleep 3
+            cd ..
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - current-date
+            - random-generated
+            - app-name
+            - rendered
+            - mocks
+            - Dockerfile-app-java21
+            - tenants_setup.sh
+            - scripts/properties_setup.py
+            - base_registry
+            - file-path-for-argocd
+            - gitops
+
+  generate-temporary-resources:
+    executor: default
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+    steps:
+      - checkout
+      - *attach_workspace
+      - run:
+          name: Leer archivo de configuración de recursos dinámicos
+          command: |
+            randomGenerated=$(cat $WORKSPACE_ROOT/random-generated)
+            
+            # Crear carpeta si no existe
+            mkdir -p $WORKSPACE_ROOT/api-test-configs
+            
+            # Leer el JSON completo
+            CONFIG_FILE=api-test-configs/dynamic-aws-resources.json
+            echo "Contenido del JSON:"
+            cat "$CONFIG_FILE"
+            
+            jq --arg randomGenerated "$randomGenerated" 'with_entries(
+              if .key == "topics" then
+              {
+                key: "kafkaTopicsArray",
+                value: (
+                  .value | map({ (.topicCode): (.topicFormat | gsub("\\$uuidRandom"; $randomGenerated)) }) 
+                  | add
+                )
+              }
+              elif .key == "generic" then
+              {
+                key: "generic",
+                value: (
+                  .value | map({ (.propertyCode): (.propertyFormat | gsub("\\$uuidRandom"; $randomGenerated)) }) | add
+                )
+              }
+              else
+                empty
+              end
+            )' "$CONFIG_FILE" > $WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json
+            
+            echo "Archivo de configuraciones renerizado:"
+            cat $WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json
+            
+            ls -la "$WORKSPACE_ROOT/api-test-configs"
+      - run:
+          name: Crear topicos de kafka
+          command: |
+            echo "Leyendo kafkaTopicsArray..."
+            authorizationHeader=$(echo "${KAFKA_ACCESS_KEY}:${KAFKA_SECRET_KEY}" | base64 -w 0)
+            echo "Header codificado: $authorizationHeader"
+            cat $WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json
+            
+            kafkaParams=""
+            
+            while IFS="=" read -r topicCode topicFormat; do
+            
+            kafkaParams="${kafkaParams} -D${topicCode}=${topicFormat}"
+            
+              # Crear tópico
+              curl --request POST \
+                --url "https://${KAFKA_CLUSTER_URL}/kafka/v3/clusters/lkc-mzyx12/topics" \
+                --header "Authorization: Basic ${authorizationHeader}" \
+                --header 'Content-Type: application/json' \
+                --data "{\"topic_name\": \"$topicFormat\", \"partitions_count\": 1}"
+            
+              # Crear tópico dlq
+              kafkaTopicWithDlq="$topicFormat.dlq"
+              curl --request POST \
+                --url "https://${KAFKA_CLUSTER_URL}/kafka/v3/clusters/lkc-mzyx12/topics" \
+                --header "Authorization: Basic ${authorizationHeader}" \
+                --header 'Content-Type: application/json' \
+                --data "{\"topic_name\": \"$kafkaTopicWithDlq\", \"partitions_count\": 1}"
+            done < <(jq -r '.kafkaTopicsArray | to_entries[] | "\(.key)=\(.value)"' "$WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json")
+            echo "Mostrando parametros:"
+            echo "$kafkaParams"
+            echo "${kafkaParams}" > $WORKSPACE_ROOT/kafkaParams
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - api-test-configs/dynamic-aws-resources-created.json
+            - kafkaParams
+
+  create-environment:
+    docker:
+      - image: 891899566293.dkr.ecr.us-east-2.amazonaws.com/cobre/cli-images/argocd:1.0.0
+        aws_auth:
+          oidc_role_arn: arn:aws:iam::891899566293:role/circleci-role-devqa
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+      FILENAME: "test-container-argocd-qa.yml"
+    steps:
+      - *attach_workspace
+      - run:
+          name: Ejecutar CLI ArgoCD
+          command: |
+            echo "Ejecutando argo CLI..."
+            echo "3.132.120.30 c7oybydstm4y5t8.qa.cobre.co" >> /etc/hosts
+            cd "$WORKSPACE_ROOT/gitops"
+            
+            echo "Archivos en la ruta utils..."
+            ls utils/
+            
+            # Constuir ruta dónde están los manifiestos
+            MANIFESTO_PATH="$WORKSPACE_ROOT/gitops/$(cat "$WORKSPACE_ROOT/file-path-for-argocd")/$FILENAME" >> $WORKSPACE_ROOT/manifestos-path
+            
+            # Validar que el archivo existe
+            if [ ! -f "$MANIFESTO_PATH" ]; then
+              echo "ERROR: El archivo $MANIFESTO_PATH no existe."
+              exit 1
+            fi
+            
+            # Ejecutar ARGOCD CLI
+            argocd --grpc-web \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            app create --file "$MANIFESTO_PATH"
+      - run:
+          name: Validar disponibilidad de Test-container
+          command: |
+            randomGenerated=$(cat $WORKSPACE_ROOT/random-generated)
+            echo "3.20.175.100  ${randomGenerated}.test-container.qa.cobre.co" >> /etc/hosts
+            url="https://${randomGenerated}.test-container.qa.cobre.co/actuator/health"
+            
+            echo "Validando estado en: $url"
+            
+            for i in $(seq 1 120); do
+              echo "Intento $i"
+              response=$(curl --silent --fail "$url" || echo "FAIL")
+              echo "Respuesta: $response"
+            
+              if echo "$response" | grep -q "UP"; then
+                echo "Aplicación disponible"
+                exit 0
+              fi
+              echo "Aplicación no disponible aún, esperando ..."
+              sleep 5
+            done
+            echo "Aplicación no respondió en el tiempo esperado."
+            exit 1
+
+      - persist_to_workspace:
+          root: *workspace_root
+          paths: manifestos-path
+
+  run-acceptance-test:
+    docker:
+      - image: cimg/openjdk:11.0
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+    steps:
+      - checkout
+      - *attach_workspace
+      - restore_cache:
+          keys:
+            - m2-{{ checksum "pom.xml" }}
+            - m2-
+      - run:
+          name: Instalar dependencias de Maven (settings.xml)
+          command: |
+            mkdir -p ~/.m2
+            cp settings.xml ~/.m2/settings.xml
+      - run:
+          name: Actualizar versión en archivo BOM
+          command: |
+            BASE_VERSION=$(grep -A1 '<artifactId>cobre-bom-qa</artifactId>' pom.xml \
+            | grep '<version>' \
+            | sed 's/.*<version>\(.*\)<\/version>.*/\1/')
+            SUFFIX="-RELEASE"
+            NEW_VERSION="${BASE_VERSION%%-*}${SUFFIX}"
+            echo "Updating BOM from ${BASE_VERSION} to ${NEW_VERSION}"
+            sed -i "s|<version>${BASE_VERSION}</version>|<version>${NEW_VERSION}</version>|" pom.xml
+            cat pom.xml
+      - run:
+          name: Ejecutar los acceptance test
+          command: |
+            kafkaParams=$(cat "$WORKSPACE_ROOT/kafkaParams")
+            echo "Parámetros kafka:"
+            echo "$kafkaParams"
+            
+            echo "Ejecutando pruebas..."
+            mvn clean test \
+            -Dkarate.options="--tags moneyMovement" \
+            -Dtest=GeneralRunner \
+            -Dkafka.cluster.url="pkc-921jm.us-east-2.aws.confluent.cloud:9092" \
+            -Dkafka.access.key="${KAFKA_ACCESS_KEY}" \
+            -Dkafka.secret.key="${KAFKA_SECRET_KEY}" \
+            ${kafkaParams}
+      - run:
+          name: Listar reportes generados
+          command: |
+            echo "Contenido de target/cucumber-reports:"
+            ls -R target/cucumber-reports
+      - save_cache:
+          paths:
+            - ~/.m2/repository
+          key: m2-{{ checksum "pom.xml" }}
+      - store_test_results:
+          path: target/cucumber-reports
+      - store_artifacts:
+          path: target/cucumber-reports/cucumber-html-reports
+          destination: acceptance-test-reports
+
+  delete-dynamic-resources:
+    executor: default
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+    steps:
+      - *attach_workspace
+      - run:
+          name: Eliminar recursos dinámicos - tópicos de kafka
+          command: |
+            echo "Eliminando tópicos de Kafka...."
+            echo "Leyendo kafkaTopicsArray..."
+            cat $WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json
+            
+            authorizationHeader=$(echo "${KAFKA_ACCESS_KEY}:${KAFKA_SECRET_KEY}" | base64 -w 0)
+            echo "Header codificado: $authorizationHeader"
+            
+            while IFS="=" read -r topicCode topicFormat; do
+              echo "Eliminando tópico: $topicCode → $topicFormat"
+              curl --request DELETE \
+                --url "https://${KAFKA_CLUSTER_URL}/kafka/v3/clusters/lkc-mzyx12/topics/$topicFormat" \
+                --header "Authorization: Basic ${authorizationHeader}" \
+                --header 'Content-Type: application/json'
+
+              # Eliminar topico dlq
+              kafkaTopicWithDlq="$topicFormat.dlq"
+              curl --request DELETE \
+                --url "https://${KAFKA_CLUSTER_URL}/kafka/v3/clusters/lkc-mzyx12/topics/$kafkaTopicWithDlq" \
+                --header "Authorization: Basic ${authorizationHeader}" \
+                --header 'Content-Type: application/json'
+            done < <(jq -r '.kafkaTopicsArray | to_entries[] | "\(.key)=\(.value)"' "$WORKSPACE_ROOT/api-test-configs/dynamic-aws-resources-created.json")
+
+      - run:
+          name: Eliminar archivos de ArgoCD en gitops
+          command: |
+            cd "$WORKSPACE_ROOT/gitops"
+            echo "Posición de la ruta:"
+            pwd
+            echo "Archivos en la ruta utils..."
+            ls utils/
+            
+            # Remover los manifiestos
+            manifestos_path=$(cat $WORKSPACE_ROOT/file-path-for-argocd)
+            echo "Eliminando los archivos en la carpeta: $manifestos_path"
+            rm -rf $manifestos_path
+            #rm -rf utils/test-container-9onkoyfy
+            # commit - push
+            git config --global user.name "infra-arq-cobre"
+            git config --global user.email "devops@cobre.co"
+            git branch
+            git add .
+            git commit -m "Remove $APP_NAME from utils folder"
+            git pull --rebase origin staging
+            git push
+            cd ..
+            rm -rf "$WORKSPACE_ROOT/gitops"
+
+  destroy-environment:
+    docker:
+      - image: 891899566293.dkr.ecr.us-east-2.amazonaws.com/cobre/cli-images/argocd:1.0.0
+        aws_auth:
+          oidc_role_arn: arn:aws:iam::891899566293:role/circleci-role-devqa
+    environment:
+      WORKSPACE_ROOT: *workspace_root
+    steps:
+      - *attach_workspace
+      - run:
+          name: Eliminar aplicación de ArgoCD
+          command: |
+            echo "Eliminando App usando argoCD CLI..."
+            echo "3.132.120.30 c7oybydstm4y5t8.qa.cobre.co" >> /etc/hosts
+            # Preparando variables
+            appName=$(cat "$WORKSPACE_ROOT/app-name")
+            appToDelete="${appName}-qa"
+            echo "Eliminando el contenedor: $appToDelete"
+            
+            # Ejecutar ARGOCD CLI
+            argocd --grpc-web \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            app delete -y "$appToDelete" --cascade 
+
+
+workflows:
+  test-pipeline:
+    jobs:
+      - prepare-config:
+          context:
+            - github-cobre
+      - generate-temporary-resources:
+          requires:
+            - prepare-config
+          context:
+            - kafka-qa
+      - aws-ecr/build_and_push_image:
+          name: build-image-app
+          attach_workspace: true
+          requires:
+            - generate-temporary-resources
+          context:
+            - cobre-dev
+          auth:
+            - aws-cli/setup:
+                role_arn: "arn:aws:iam::891899566293:role/circleci-role-devqa"
+          account_id: $AWS_ACCOUNT_ID
+          region: us-east-2
+          repo: "cobre/testing-images/qa_utilnetworkroutingacceptancetest"
+          platform: linux/arm64
+          path: .
+          dockerfile: Dockerfile-app-java21
+          tag: "<< pipeline.number >>-app"
+          extra_build_args: >-
+            --build-arg FROM_FILE=891899566293.dkr.ecr.us-east-2.amazonaws.com/qa/utilitarios/util-network-routing:<< pipeline.parameters.version_tag >>
+
+      - aws-ecr/build_and_push_image:
+          name: build-image-mock
+          attach_workspace: true
+          requires:
+            - generate-temporary-resources
+          context:
+            - cobre-dev
+          auth:
+            - aws-cli/setup:
+                role_arn: "arn:aws:iam::891899566293:role/circleci-role-devqa"
+          account_id: $AWS_ACCOUNT_ID
+          region: us-east-2
+          repo: "cobre/testing-images/qa_utilnetworkroutingacceptancetest"
+          platform: linux/arm64
+          path: .
+          dockerfile: mocks/Dockerfile-mocks
+          tag: "<< pipeline.number >>-mocks"
+      - create-environment:
+          requires:
+            - build-image-app
+            - build-image-mock
+          context:
+            - argocd-qa
+      - run-acceptance-test:
+          requires:
+            - create-environment
+          context:
+            - jfrog-cobre
+            - kafka-qa
+      - delete-dynamic-resources:
+          requires:
+            - run-acceptance-test
+          context:
+            - kafka-qa
+      - destroy-environment:
+          requires:
+            - delete-dynamic-resources
+          context:
+            - argocd-qa
